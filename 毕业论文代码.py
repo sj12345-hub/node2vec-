@@ -26,7 +26,262 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 # 支持中文
 mpl.rcParams['font.sans-serif'] = ['SimHei']
+# 基本的网络分析
+def network_analysis(G):
+    # 计算平均度
+    degrees = dict(G.degree())
+    average_degree = sum(degrees.values()) / len(degrees)
+    # 计算平均聚类系数
+    average_clustering = nx.average_clustering(G)
+    # 计算平均最短路径长度
+    try:
+        average_shortest_path = nx.average_shortest_path_length(G)
+    except nx.NetworkXError:
+        average_shortest_path = "未计算"
+    return average_degree, average_clustering, average_shortest_path
 
+
+# 可视化基本网络分析结果
+def visualize_network_metrics(metrics, values, title):
+    plt.figure(figsize=(8, 6))
+    # 调整柱子宽度为 0.4
+    bars = plt.bar(metrics, values, color=['blue', 'green', 'orange'], width=0.4)
+
+
+    # 调整坐标轴字体大小
+    plt.xticks(fontsize=10)
+    plt.yticks(fontsize=10)
+
+    # 调整标题和标签字体大小
+    plt.title(title, fontsize=14)
+    plt.xlabel('网络指标', fontsize=12)
+    plt.ylabel('值', fontsize=12)
+
+    plt.savefig(title.replace(" ", "_") + ".png", dpi=1200)
+    plt.rcParams['figure.dpi'] = 300
+    plt.show()
+
+
+# 提取更丰富的节点特征
+def extract_node_features(G):
+    degrees = dict(G.degree())
+    # 度中心性
+    degree_centrality = nx.degree_centrality(G)
+    # 介数中心性
+    betweenness_centrality = nx.betweenness_centrality(G)
+    # 接近中心性
+    closeness_centrality = nx.closeness_centrality(G)
+
+    node_features = []
+    for i in sorted(G.nodes()):
+        features = [degrees[i], degree_centrality[i], betweenness_centrality[i], closeness_centrality[i]]
+        node_features.append(features)
+
+    return np.array(node_features)
+
+
+# t - SNE 降维，调整参数
+def tsne_reduction(node_features):
+    tsne = TSNE(n_components=2, perplexity=30, learning_rate=200, random_state=42)
+    return tsne.fit_transform(node_features)
+
+
+# 可视化 t - SNE 降维结果
+def visualize_tsne(node_features_2d, labels, title):
+    plt.figure(figsize=(8, 8))
+    # 生成随机颜色映射
+    colors = np.random.rand(len(node_features_2d))
+    sc = plt.scatter(node_features_2d[:, 0], node_features_2d[:, 1], c=colors, cmap='viridis')
+    for i, label in enumerate(labels):
+        plt.annotate(label, (node_features_2d[i, 0], node_features_2d[i, 1]), textcoords="offset points",
+                     xytext=(0, 5), ha='center', fontsize=8)
+    plt.title(title)
+    plt.xlabel('t - SNE 第一维')
+    plt.ylabel('t - SNE 第二维')
+    # 添加颜色条
+    plt.colorbar(sc)
+    plt.savefig(title.replace(" ", "_") + ".png", dpi=1200)
+    plt.rcParams['figure.dpi'] = 300
+    plt.show()
+
+
+def simulate_failure(G, failure_type, removal_ratio, attack_strategy='random'):
+    G_failure = G.copy()
+    total = G_failure.number_of_nodes() if failure_type == 'node' else G_failure.number_of_edges()
+    num_failure = int(total * removal_ratio)
+    num_failure = max(1, min(num_failure, total))  # 确保移除数量在合理范围
+
+    if failure_type == 'node':
+        if attack_strategy == 'random':
+            nodes_to_remove = random.sample(list(G_failure.nodes()), num_failure)
+        elif attack_strategy.startswith('high_'):
+            # 提取中心性类型（如high_betweenness, high_degree）
+            centrality_type = attack_strategy.split('_')[1]
+            nodes = G_failure.nodes()
+            if centrality_type == 'betweenness':
+                if G_failure.is_directed():
+                    centrality = nx.betweenness_centrality(G_failure, directed=True)
+                else:
+                    centrality = nx.betweenness_centrality(G_failure)
+            elif centrality_type == 'degree':
+                centrality = {node: G_failure.degree(node) for node in nodes}
+            elif centrality_type == 'closeness':
+                if G_failure.is_directed():
+                    centrality = nx.closeness_centrality(G_failure, directed=True)
+                else:
+                    centrality = nx.closeness_centrality(G_failure)
+            else:
+                raise ValueError("不支持的中心性类型")
+            # 按中心性降序排序，选择前num_failure个节点
+            nodes_to_remove = sorted(centrality.keys(), key=lambda x: -centrality[x])[:num_failure]
+        G_failure.remove_nodes_from(nodes_to_remove)
+
+    elif failure_type == 'edge':
+        if attack_strategy == 'random':
+            edges_to_remove = random.sample(list(G_failure.edges()), num_failure)
+        elif attack_strategy == 'high_betweenness_edges':
+            if G_failure.is_directed():
+                edge_centrality = nx.edge_betweenness_centrality(G_failure, directed=True)
+            else:
+                edge_centrality = nx.edge_betweenness_centrality(G_failure)
+            edges = sorted(edge_centrality.keys(), key=lambda x: -edge_centrality[x])[:num_failure]
+            edges_to_remove = edges
+        G_failure.remove_edges_from(edges_to_remove)
+
+    return G_failure
+
+def evaluate_robustness(G_original, G_failure):
+    metrics = {}
+
+    # 全局鲁棒性指标
+    original_nodes = G_original.number_of_nodes()
+    failure_nodes = G_failure.number_of_nodes()
+    failure_edges = G_failure.number_of_edges()
+
+    # 最大连通子图大小（占原网络比例）
+    if G_failure.number_of_nodes() == 0:
+        lcc_size = 0
+    else:
+        largest_cc = max(nx.connected_components(G_failure.to_undirected()), key=len, default=set())
+        lcc_size = len(largest_cc) / original_nodes
+    metrics['lcc_ratio'] = lcc_size
+
+    # 连通分量数量
+    if G_failure.is_directed():
+        metrics['num_components'] = nx.number_weakly_connected_components(G_failure)
+    else:
+        metrics['num_components'] = nx.number_connected_components(G_failure)
+
+    # 效率（处理不连通图的最短路径）
+    try:
+        all_pairs = nx.all_pairs_shortest_path_length(G_failure)
+        efficiency_sum = 0
+        for _, paths in all_pairs:
+            for length in paths.values():
+                if length != 0:
+                    efficiency_sum += 1 / length
+        efficiency = efficiency_sum / (original_nodes ** 2)
+    except nx.NetworkXException:  # 处理不连通图中无法到达的节点对
+        efficiency = 0
+    metrics['efficiency'] = efficiency
+
+    # 保留原指标（作为补充）
+    metrics['avg_degree'] = sum(dict(G_failure.degree()).values()) / failure_nodes if failure_nodes != 0 else 0
+    if G_failure.is_directed():
+        metrics['clustering_coeff'] = 0  # 有向图聚类系数处理，可根据需要修改
+    else:
+        metrics['clustering_coeff'] = nx.average_clustering(G_failure) if failure_nodes >= 3 else 0  # 聚类系数需至少3个节点
+
+    return metrics
+
+
+
+# 评估网络恢复能力与鲁棒性
+def evaluate_resilience(G, failure_type, num_failure, recovery_attempts):
+    original_metrics = network_analysis(G)
+    resilience_scores = []
+    for _ in range(recovery_attempts):
+        G_failure = simulate_failure(G, failure_type, num_failure)
+        failure_metrics = network_analysis(G_failure)
+        score = []
+        for i in range(len(original_metrics)):
+            if isinstance(original_metrics[i], str) or isinstance(failure_metrics[i], str):
+                score.append(0)
+            else:
+                score.append(1 - abs((failure_metrics[i] - original_metrics[i]) / original_metrics[i]))
+        resilience_scores.append(np.mean(score))
+    return np.mean(resilience_scores)
+
+
+# 关键节点与路径分析
+def identify_critical_nodes_and_paths(G):
+    # 结合介数中心性和特征向量中心性
+    betweenness = nx.betweenness_centrality(G)
+    eigenvector = nx.eigenvector_centrality(G)
+    combined_centrality = {node: betweenness[node] * eigenvector[node] for node in G.nodes()}
+    sorted_nodes = sorted(combined_centrality.items(), key=lambda item: item[1], reverse=True)
+    critical_nodes = [node for node, _ in sorted_nodes[:10]]
+
+    # 隐性路径分析
+    hidden_paths = []
+    for source in critical_nodes:
+        for target in critical_nodes:
+            if source != target:
+                try:
+                    all_paths = list(nx.all_simple_paths(G, source, target, cutoff=3))
+                    if len(all_paths) > 1:
+                        for path in all_paths[1:]:
+                            hidden_paths.append(path)
+                except nx.NetworkXNoPath:
+                    continue
+
+    return critical_nodes, hidden_paths
+
+
+# 对隐性路径按重要性排序
+def sort_hidden_paths_by_importance(G, hidden_paths):
+    # 计算图中所有节点的介数中心性
+    betweenness = nx.betweenness_centrality(G)
+    path_importance = []
+    for path in hidden_paths:
+        # 计算路径上所有节点的介数中心性之和
+        node_betweenness_sum = sum([betweenness[node] for node in path])
+        # 初始化边权重之和为 0
+        edge_weight_sum = 0
+        # 遍历路径中的每一对相邻节点
+        for i in range(len(path) - 1):
+            u = path[i]
+            v = path[i + 1]
+            # 累加边的权重，如果边不存在则默认权重为 1
+            edge_weight_sum += G.get_edge_data(u, v, default={'weight': 1}).get('weight', 1)
+        # 计算路径的重要性，即节点介数中心性之和乘以边权重之和
+        importance = node_betweenness_sum * edge_weight_sum
+        path_importance.append((path, importance))
+    # 根据路径的重要性对路径进行降序排序
+    sorted_paths = sorted(path_importance, key=lambda x: x[1], reverse=True)
+    # 仅返回排序后的路径，不包含重要性数值
+    return [path for path, _ in sorted_paths]
+
+
+# 优化策略模拟
+def optimize_network(G, critical_nodes):
+    G_optimized = G.copy()
+    # 增加关键节点的权重
+    for node in critical_nodes:
+        for neighbor in G_optimized.neighbors(node):
+            if G_optimized.has_edge(node, neighbor):
+                G_optimized[node][neighbor]['weight'] = 2
+
+    # 增加冗余路径
+    for i in range(5):
+        source = random.choice(list(G_optimized.nodes()))
+        target = random.choice(list(G_optimized.nodes()))
+        if source != target and not G_optimized.has_edge(source, target):
+            G_optimized.add_edge(source, target)
+
+    return G_optimized
+
+##读入数据，以相对路径读入
 a = pd.read_csv("C:/Users/15047/Desktop/2025.csv")
 
 b = a.drop([42, 43])
@@ -195,183 +450,22 @@ nx.draw(G, pos, node_color=colors, with_labels=False, node_size=400, font_size=2
         connectionstyle='arc3,rad=0.2')
 nx.draw_networkx_labels(G, pos, labels=labels, font_size=18, font_color='red')
 plt.show()
+# 根据聚类标签将图拆分成三个子图
+subgraphs = []
+for cluster in range(3):
+    cluster_nodes = [node for node, label in enumerate(cluster_labels) if label == cluster]
+    subgraph = G.subgraph(cluster_nodes)
+    subgraphs.append(subgraph)
 
-# 基本的网络分析
-def network_analysis(G):
-    # 计算平均度
-    degrees = dict(G.degree())
-    average_degree = sum(degrees.values()) / len(degrees)
-    # 计算平均聚类系数
-    average_clustering = nx.average_clustering(G)
-    # 计算平均最短路径长度
-    try:
-        average_shortest_path = nx.average_shortest_path_length(G)
-    except nx.NetworkXError:
-        average_shortest_path = "未计算"
-    return average_degree, average_clustering, average_shortest_path
-
-
-# 可视化基本网络分析结果
-def visualize_network_metrics(metrics, values, title):
-    plt.figure(figsize=(8, 6))
-    # 调整柱子宽度为 0.4
-    bars = plt.bar(metrics, values, color=['blue', 'green', 'orange'], width=0.4)
-
-
-    # 调整坐标轴字体大小
-    plt.xticks(fontsize=10)
-    plt.yticks(fontsize=10)
-
-    # 调整标题和标签字体大小
-    plt.title(title, fontsize=14)
-    plt.xlabel('网络指标', fontsize=12)
-    plt.ylabel('值', fontsize=12)
-
-    plt.savefig(title.replace(" ", "_") + ".png", dpi=1200)
-    plt.rcParams['figure.dpi'] = 300
+# 绘制三个网络图
+for i, subgraph in enumerate(subgraphs):
+    plt.figure(figsize=(10, 8))
+    pos = nx.spring_layout(subgraph, k=0.3)
+    nx.draw(subgraph, pos, with_labels=False, node_size=200, edge_color='red', connectionstyle='arc3,rad=0.2')
+    subgraph_labels = {node: labels[node] for node in subgraph.nodes()}
+    nx.draw_networkx_labels(subgraph, pos, labels=subgraph_labels, font_size=10, font_color='red')
+    plt.title(f'Cluster {i} Network Graph')
     plt.show()
-
-
-# 提取更丰富的节点特征
-def extract_node_features(G):
-    degrees = dict(G.degree())
-    # 度中心性
-    degree_centrality = nx.degree_centrality(G)
-    # 介数中心性
-    betweenness_centrality = nx.betweenness_centrality(G)
-    # 接近中心性
-    closeness_centrality = nx.closeness_centrality(G)
-
-    node_features = []
-    for i in sorted(G.nodes()):
-        features = [degrees[i], degree_centrality[i], betweenness_centrality[i], closeness_centrality[i]]
-        node_features.append(features)
-
-    return np.array(node_features)
-
-
-# t - SNE 降维，调整参数
-def tsne_reduction(node_features):
-    tsne = TSNE(n_components=2, perplexity=30, learning_rate=200, random_state=42)
-    return tsne.fit_transform(node_features)
-
-
-# 可视化 t - SNE 降维结果
-def visualize_tsne(node_features_2d, labels, title):
-    plt.figure(figsize=(8, 8))
-    # 生成随机颜色映射
-    colors = np.random.rand(len(node_features_2d))
-    sc = plt.scatter(node_features_2d[:, 0], node_features_2d[:, 1], c=colors, cmap='viridis')
-    for i, label in enumerate(labels):
-        plt.annotate(label, (node_features_2d[i, 0], node_features_2d[i, 1]), textcoords="offset points",
-                     xytext=(0, 5), ha='center', fontsize=8)
-    plt.title(title)
-    plt.xlabel('t - SNE 第一维')
-    plt.ylabel('t - SNE 第二维')
-    # 添加颜色条
-    plt.colorbar(sc)
-    plt.savefig(title.replace(" ", "_") + ".png", dpi=1200)
-    plt.rcParams['figure.dpi'] = 300
-    plt.show()
-
-
-# 模拟节点/边失效
-def simulate_failure(G, failure_type, num_failure):
-    G_failure = G.copy()
-    if failure_type == 'node':
-        nodes_to_remove = random.sample(list(G_failure.nodes()), num_failure)
-        G_failure.remove_nodes_from(nodes_to_remove)
-    elif failure_type == 'edge':
-        edges_to_remove = random.sample(list(G_failure.edges()), num_failure)
-        G_failure.remove_edges_from(edges_to_remove)
-    return G_failure
-
-
-# 评估网络恢复能力与鲁棒性
-def evaluate_resilience(G, failure_type, num_failure, recovery_attempts):
-    original_metrics = network_analysis(G)
-    resilience_scores = []
-    for _ in range(recovery_attempts):
-        G_failure = simulate_failure(G, failure_type, num_failure)
-        failure_metrics = network_analysis(G_failure)
-        score = []
-        for i in range(len(original_metrics)):
-            if isinstance(original_metrics[i], str) or isinstance(failure_metrics[i], str):
-                score.append(0)
-            else:
-                score.append(1 - abs((failure_metrics[i] - original_metrics[i]) / original_metrics[i]))
-        resilience_scores.append(np.mean(score))
-    return np.mean(resilience_scores)
-
-
-# 关键节点与路径分析
-def identify_critical_nodes_and_paths(G):
-    # 结合介数中心性和特征向量中心性
-    betweenness = nx.betweenness_centrality(G)
-    eigenvector = nx.eigenvector_centrality(G)
-    combined_centrality = {node: betweenness[node] * eigenvector[node] for node in G.nodes()}
-    sorted_nodes = sorted(combined_centrality.items(), key=lambda item: item[1], reverse=True)
-    critical_nodes = [node for node, _ in sorted_nodes[:10]]
-
-    # 隐性路径分析
-    hidden_paths = []
-    for source in critical_nodes:
-        for target in critical_nodes:
-            if source != target:
-                try:
-                    all_paths = list(nx.all_simple_paths(G, source, target, cutoff=3))
-                    if len(all_paths) > 1:
-                        for path in all_paths[1:]:
-                            hidden_paths.append(path)
-                except nx.NetworkXNoPath:
-                    continue
-
-    return critical_nodes, hidden_paths
-
-
-# 对隐性路径按重要性排序
-def sort_hidden_paths_by_importance(G, hidden_paths):
-    # 计算图中所有节点的介数中心性
-    betweenness = nx.betweenness_centrality(G)
-    path_importance = []
-    for path in hidden_paths:
-        # 计算路径上所有节点的介数中心性之和
-        node_betweenness_sum = sum([betweenness[node] for node in path])
-        # 初始化边权重之和为 0
-        edge_weight_sum = 0
-        # 遍历路径中的每一对相邻节点
-        for i in range(len(path) - 1):
-            u = path[i]
-            v = path[i + 1]
-            # 累加边的权重，如果边不存在则默认权重为 1
-            edge_weight_sum += G.get_edge_data(u, v, default={'weight': 1}).get('weight', 1)
-        # 计算路径的重要性，即节点介数中心性之和乘以边权重之和
-        importance = node_betweenness_sum * edge_weight_sum
-        path_importance.append((path, importance))
-    # 根据路径的重要性对路径进行降序排序
-    sorted_paths = sorted(path_importance, key=lambda x: x[1], reverse=True)
-    # 仅返回排序后的路径，不包含重要性数值
-    return [path for path, _ in sorted_paths]
-
-
-# 优化策略模拟
-def optimize_network(G, critical_nodes):
-    G_optimized = G.copy()
-    # 增加关键节点的权重
-    for node in critical_nodes:
-        for neighbor in G_optimized.neighbors(node):
-            if G_optimized.has_edge(node, neighbor):
-                G_optimized[node][neighbor]['weight'] = 2
-
-    # 增加冗余路径
-    for i in range(5):
-        source = random.choice(list(G_optimized.nodes()))
-        target = random.choice(list(G_optimized.nodes()))
-        if source != target and not G_optimized.has_edge(source, target):
-            G_optimized.add_edge(source, target)
-
-    return G_optimized
-
 
 
 # 原始图分析
@@ -393,6 +487,71 @@ node_resilience = evaluate_resilience(G, 'node', 5, 100)
 edge_resilience = evaluate_resilience(G, 'edge', 10, 100)
 print(f"节点失效恢复能力得分: {node_resilience}")
 print(f"边失效恢复能力得分: {edge_resilience}")
+#模拟鲁棒性
+
+original_metrics = evaluate_robustness(D, D)  # 原始网络指标
+
+
+
+# 2. 测试不同攻击策略（以节点攻击为例，移除10%节点）
+removal_ratio = 0.3
+strategies = ['random', 'high_degree', 'high_betweenness']
+simulation_times = 10  # 模拟次数
+
+for strategy in strategies:
+    total_lcc_ratio = 0
+    total_num_components = 0
+    total_efficiency = 0
+    total_avg_degree = 0
+    total_clustering_coeff = 0
+
+    for _ in range(simulation_times):
+        D_failure = simulate_failure(D, 'node', removal_ratio, attack_strategy=strategy)
+        metrics = evaluate_robustness(D, D_failure)
+
+        total_lcc_ratio += metrics['lcc_ratio']
+        total_num_components += metrics['num_components']
+        total_efficiency += metrics['efficiency']
+        total_avg_degree += metrics['avg_degree']
+        total_clustering_coeff += metrics['clustering_coeff']
+
+    avg_lcc_ratio = total_lcc_ratio / simulation_times
+    avg_num_components = total_num_components / simulation_times
+    avg_efficiency = total_efficiency / simulation_times
+    avg_avg_degree = total_avg_degree / simulation_times
+    avg_clustering_coeff = total_clustering_coeff / simulation_times
+
+    print(f"策略：{strategy} | 平均最大连通子图比例：{avg_lcc_ratio:.3f} | 平均连通分量数：{avg_num_components:.3f} | 平均效率：{avg_efficiency:.3f} | 平均平均度：{avg_avg_degree:.3f} | 平均聚类系数：{avg_clustering_coeff:.3f}")
+
+# 2. 测试不同攻击策略（以节点攻击为例，移除10%节点）
+removal_ratio = 0.05
+strategies = ['random', 'high_betweenness_edges']
+simulation_times = 100  # 模拟次数
+
+for strategy in strategies:
+    total_lcc_ratio = 0
+    total_num_components = 0
+    total_efficiency = 0
+    total_avg_degree = 0
+    total_clustering_coeff = 0
+
+    for _ in range(simulation_times):
+        D_failure = simulate_failure(D, 'edge', removal_ratio, attack_strategy=strategy)
+        metrics = evaluate_robustness(D, D_failure)
+
+        total_lcc_ratio += metrics['lcc_ratio']
+        total_num_components += metrics['num_components']
+        total_efficiency += metrics['efficiency']
+        total_avg_degree += metrics['avg_degree']
+        total_clustering_coeff += metrics['clustering_coeff']
+
+    avg_lcc_ratio = total_lcc_ratio / simulation_times
+    avg_num_components = total_num_components / simulation_times
+    avg_efficiency = total_efficiency / simulation_times
+    avg_avg_degree = total_avg_degree / simulation_times
+    avg_clustering_coeff = total_clustering_coeff / simulation_times
+
+    print(f"策略：{strategy} | 平均最大连通子图比例：{avg_lcc_ratio:.3f} | 平均连通分量数：{avg_num_components:.3f} | 平均效率：{avg_efficiency:.3f} | 平均平均度：{avg_avg_degree:.3f} | 平均聚类系数：{avg_clustering_coeff:.3f}")
 
 # 关键节点与路径分析
 critical_nodes, hidden_paths = identify_critical_nodes_and_paths(G)
@@ -594,6 +753,76 @@ print(f"增加节点权重后边失效恢复能力得分: {weight_optimized_edge
 print(f"增加冗余边后节点失效恢复能力得分: {edge_optimized_node_resilience}")
 print(f"增加冗余边后边失效恢复能力得分: {edge_optimized_edge_resilience}")
 
+node_labels = list(G.nodes())
+print("节点名称标签:")
+print(node_labels)
 
+pagerank_scores = nx.pagerank(G)
 
+sorted_pagerank = sorted(pagerank_scores.items(), key=lambda item: item[1], reverse=True)
+print("PageRank Scores (Sorted):")
+for node, score in sorted_pagerank:
+  print(f"Node {node}: {score:.4f}")
+  # 使用 HITS 算法识别关键节点
+hubs, authorities = nx.hits(G)
+# 按枢纽得分排序
+sorted_hubs = sorted(hubs.items(), key=lambda item: item[1], reverse=True)
+# 按权威得分排序
+sorted_authorities = sorted(authorities.items(), key=lambda item: item[1], reverse=True)
 
+import plotly.io as pio
+import plotly.graph_objects as go
+import networkx as nx
+import numpy as np
+
+pio.renderers.default = 'browser'
+
+# 计算每条路径的介数中心性总和
+betweenness = nx.betweenness_centrality(G)
+path_importance = []
+for path in hidden_paths:
+    node_betweenness_sum = sum([betweenness[node] for node in path])
+    path_importance.append((path, node_betweenness_sum))
+
+# 按介数中心性总和降序排序
+path_importance.sort(key=lambda x: x[1], reverse=True)
+
+# 选取排名前十的路径
+top_ten_paths = path_importance[:10]
+top_ten_path_importance = [score for _, score in top_ten_paths]
+
+# 找到最大和最小的重要性值，用于颜色映射
+max_importance = max(top_ten_path_importance)
+min_importance = min(top_ten_path_importance)
+
+# 创建一个矩阵，用于绘制热力图
+heatmap_data = np.array(top_ten_path_importance).reshape(-1, 1)
+
+# 创建 Plotly 热力图对象
+fig = go.Figure(data=go.Heatmap(
+    z=heatmap_data,
+    colorscale='Viridis',
+    zmin=min_importance,
+    zmax=max_importance,
+    hoverongaps=False,
+    hovertemplate='路径编号: %{y}<br>介数中心性总和: %{z}<extra></extra>'
+))
+
+# 更新布局
+fig.update_layout(
+    title='排名前十的隐性路径重要性热力图',
+    xaxis_title='路径索引',
+    yaxis_title='路径编号',
+    coloraxis_colorbar=dict(
+        title='介数中心性总和',
+        tickfont=dict(size=10)
+    ),
+    width=800,
+    height=600
+)
+
+# 显示图形
+fig.show()
+    
+
+    
